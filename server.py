@@ -1,1169 +1,1341 @@
-import json
+
+import os
 import re
+import json
 import hmac
+import uuid
 import hashlib
 import secrets
-from pathlib import Path
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, quote, unquote
+import logging
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 from email.parser import BytesParser
 from email.policy import default
+from http.cookies import SimpleCookie
 
-BASE = Path(__file__).resolve().parent
-CHANNELS = BASE / "Channels"
-USERS_FILE = BASE / "users.json"
+from supabase import create_client
+
+# ============================================================
+# POUPLAY - VERSION SUPABASE
+# ============================================================
+
 HOST = "0.0.0.0"
-PORT = 8000
-MAX_VIDEO_SIZE = 500 * 1024 * 1024
+PORT = int(os.environ.get("PORT", "8000"))
 
-CHANNELS.mkdir(exist_ok=True)
+# LÍMITE EXACTO: 50 MiB = 52,428,800 bytes.
+# Se acepta exactamente ese tamaño.
+# Cualquier archivo mayor se rechaza.
+MAX_VIDEO_SIZE = 50 * 1024 * 1024
 
-HTML = r"""<!DOCTYPE html>
+BUCKET = "pouplay-videos"
+SESSION_COOKIE = "pouplay_session"
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
+
+if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+    raise RuntimeError(
+        "Configura SUPABASE_URL y SUPABASE_SECRET_KEY "
+        "en las variables de entorno de Render."
+    )
+
+supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+SESSIONS = {}
+
+logging.basicConfig(level=logging.INFO)
+
+
+def db(table):
+    return supabase.table(table)
+
+
+def password_hash(password, salt):
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt),
+        250000
+    ).hex()
+
+
+def public_video_url(path):
+    return supabase.storage.from_(BUCKET).get_public_url(path)
+
+
+def get_user_by_name(username):
+    rows = (
+        db("app_users")
+        .select("*")
+        .ilike("username", username)
+        .limit(10)
+        .execute()
+        .data or []
+    )
+
+    for user in rows:
+        if user["username"].lower() == username.lower():
+            return user
+
+    return None
+
+
+def get_channel(channel_id):
+    rows = (
+        db("channels")
+        .select("*")
+        .eq("id", channel_id)
+        .limit(1)
+        .execute()
+        .data or []
+    )
+    return rows[0] if rows else None
+
+
+def get_video(video_id):
+    rows = (
+        db("videos")
+        .select("*")
+        .eq("id", video_id)
+        .limit(1)
+        .execute()
+        .data or []
+    )
+    return rows[0] if rows else None
+
+
+def video_data(video, viewer=None):
+    channel = get_channel(video["channel_id"])
+
+    likes = (
+        db("video_likes")
+        .select("id")
+        .eq("video_id", video["id"])
+        .execute()
+        .data or []
+    )
+
+    liked = False
+
+    if viewer:
+        liked = bool(
+            db("video_likes")
+            .select("id")
+            .eq("video_id", video["id"])
+            .eq("username", viewer)
+            .limit(1)
+            .execute()
+            .data
+        )
+
+    return {
+        "id": video["id"],
+        "title": video["title"],
+        "description": video.get("description", ""),
+        "url": video["video_url"],
+        "likes": len(likes),
+        "liked": liked,
+        "channel": channel["name"] if channel else "Canal eliminado",
+        "channelId": video["channel_id"],
+        "channelOwner": channel["owner_username"] if channel else "",
+        "createdAt": video.get("created_at")
+    }
+
+
+def channel_data(channel, viewer=None):
+    channel_id = channel["id"]
+
+    video_rows = (
+        db("videos")
+        .select("*")
+        .eq("channel_id", channel_id)
+        .order("created_at", desc=True)
+        .execute()
+        .data or []
+    )
+
+    subscriptions = (
+        db("subscriptions")
+        .select("id")
+        .eq("channel_id", channel_id)
+        .execute()
+        .data or []
+    )
+
+    subscribed = False
+
+    if viewer:
+        subscribed = bool(
+            db("subscriptions")
+            .select("id")
+            .eq("username", viewer)
+            .eq("channel_id", channel_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+
+    return {
+        "id": channel_id,
+        "name": channel["name"],
+        "description": channel.get("description", ""),
+        "owner": channel["owner_username"],
+        "subscribers": len(subscriptions),
+        "subscribed": subscribed,
+        "videos": [video_data(v, viewer) for v in video_rows],
+        "createdAt": channel.get("created_at")
+    }
+
+
+HTML = r'''<!doctype html>
 <html lang="es">
 <head>
-<meta charset="UTF-8">
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#151923">
 <title>PouPlay</title>
 <style>
 *{box-sizing:border-box}
-body{margin:0;background:#101010;color:#f5f5f5;font:15px Arial}
-header{position:sticky;top:0;background:#191919;padding:14px;display:flex;gap:10px;align-items:center;z-index:5;border-bottom:1px solid #333}
-.logo{font-size:23px;font-weight:bold;color:#ff4545;cursor:pointer;white-space:nowrap}
-main{max-width:1050px;margin:auto;padding:18px}
-button,input,textarea{font:inherit;border-radius:9px;padding:11px;border:1px solid #444}
-button{background:#292929;color:white;cursor:pointer}
-button:hover{background:#414141}
-button:disabled{opacity:.5;cursor:not-allowed}
-input,textarea{background:#171717;color:white;width:100%;margin:5px 0 12px}
-textarea{resize:vertical;min-height:100px}
-.panel{background:#1c1c1c;border-radius:14px;padding:18px;margin:15px 0}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:15px}
-.video{background:#202020;border-radius:12px;overflow:hidden;cursor:pointer}
-.video video{width:100%;aspect-ratio:16/9;object-fit:cover;background:#000}
-.info{padding:12px}
-.muted{color:#aaa;font-size:13px}
+body{margin:0;background:#10131a;color:#f3f4f8;font:15px Arial,sans-serif}
+header{position:sticky;top:0;z-index:5;background:#171b25;
+display:flex;align-items:center;gap:12px;padding:12px 16px;
+border-bottom:1px solid #303646}
+.logo{font-size:24px;font-weight:bold;color:#72b7ff;cursor:pointer}
+button,input,textarea,select{font:inherit}
+button{border:0;border-radius:9px;padding:10px 13px;
+background:#30394b;color:white;cursor:pointer}
+button:hover{filter:brightness(1.15)}
+button:disabled{opacity:.55;cursor:not-allowed}
+.primary{background:#3478f6}
+input,textarea,select{width:100%;padding:12px;border-radius:9px;
+border:1px solid #343b4d;background:#1a1f2b;color:white}
+textarea{min-height:90px;resize:vertical}
+.grow{flex:1;min-width:150px}
+main{max-width:1100px;margin:auto;padding:18px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px}
+.card{background:#1a1f2b;border:1px solid #2c3343;border-radius:13px;overflow:hidden}
+.card video{width:100%;aspect-ratio:16/9;object-fit:contain;background:#080a0f}
+.cardbody{padding:13px}
+.muted{color:#aab3c5;font-size:13px}
+h1,h2,h3{margin-top:8px}
+section{margin:20px 0}
 .hidden{display:none!important}
-.error{color:#ff7979}
-.success{color:#8be6a2}
-.spacer{flex:1}
-video.player{width:100%;max-height:65vh;background:#000;border-radius:12px}
-#fileName{overflow-wrap:anywhere}
-.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:12px 0}
-.subscribe-button{background:#ff3030;color:white;border-color:#ff3030}
-.subscribe-button.subscribed{background:#333;color:white;border-color:#555}
-#who{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}
-.primary{background:#ff3030;border-color:#ff3030}
-.row{display:flex;gap:8px;flex-wrap:wrap}
-@media(max-width:520px){
- header{padding:9px;gap:5px}
- .logo{font-size:18px}
- header button{padding:9px 8px;font-size:13px}
- #who{max-width:95px;font-size:12px}
- main{padding:10px}
- .panel{padding:13px}
+.panel{max-width:520px;margin:25px auto;padding:20px;
+background:#1a1f2b;border-radius:14px}
+.panel input,.panel textarea,.panel select{margin:7px 0}
+video.big{width:100%;max-height:65vh;background:#050609;border-radius:12px}
+#status{color:#ffd37c;overflow-wrap:anywhere}
+a{color:#83baff}
+progress{height:16px}
+@media(max-width:600px){
+ header{flex-wrap:wrap}
+ main{padding:12px}
+ .grid{grid-template-columns:1fr}
 }
 </style>
 </head>
 <body>
 <header>
-  <div class="logo" onclick="home()">▶ PouPlay</div>
-  <div class="spacer"></div>
-  <span id="who" class="muted">Sin iniciar sesión</span>
-  <button id="createButton" class="hidden primary" onclick="openCreate()">Crear</button>
-  <button id="authButton" onclick="showAuth()">Entrar</button>
-  <button id="logoutButton" class="hidden" onclick="logout()">Salir</button>
+  <div class="logo" onclick="home()">🐾 PouPlay</div>
+  <input id="search" class="grow" placeholder="Buscar videos o canales..." oninput="render()">
+  <button onclick="home()">Inicio</button>
+  <button onclick="showPage('channels')">Canales</button>
+  <button onclick="showPage('upload')">Subir video</button>
+  <button id="accountBtn" onclick="showPage('account')">Entrar</button>
 </header>
 
 <main>
-<section id="auth" class="panel hidden">
-  <h2 id="authTitle">Crear cuenta</h2>
-  <label>Nombre de usuario</label>
-  <input id="username" maxlength="24" autocomplete="username" placeholder="Tu usuario">
-  <label>Contraseña</label>
-  <input id="password" type="password" maxlength="128" autocomplete="current-password" placeholder="Tu contraseña">
-  <div class="row">
-    <button class="primary" onclick="submitAuth()">Continuar</button>
-    <button id="modeButton" onclick="toggleAuthMode()">Ya tengo cuenta</button>
-    <button onclick="cancelScreen()">Cancelar</button>
-  </div>
-  <p id="authMessage" class="muted"></p>
-</section>
+<div id="status" role="status"></div>
 
-<section id="createPanel" class="panel hidden">
-  <h2>Crear mi canal</h2>
-  <p class="muted">Antes de subir videos, necesitas crear tu canal.</p>
-  <label>Nombre de tu canal</label>
-  <input id="channelName" maxlength="40" placeholder="Nombre de tu canal">
-  <div class="row">
-    <button class="primary" onclick="createChannel()">Crear canal</button>
-    <button onclick="cancelScreen()">Cancelar</button>
-  </div>
-  <p id="channelMessage" class="muted"></p>
-</section>
-
-<section id="uploadPanel" class="panel hidden">
-  <h2>Subir video</h2>
-  <p class="muted">Elige un archivo MP4, ponle título y escribe su descripción.</p>
-  <label>Archivo de video (.mp4)</label>
-  <input id="videoFile" type="file" accept=".mp4,video/mp4">
-  <p id="fileName" class="muted">No has seleccionado ningún video.</p>
-  <label>Título</label>
-  <input id="uploadTitle" maxlength="120" placeholder="Título del video">
-  <label>Descripción</label>
-  <textarea id="uploadDescription" maxlength="5000" placeholder="¿De qué trata tu video?"></textarea>
-  <div class="row">
-    <button id="uploadButton" class="primary" onclick="uploadVideo()">Subir video</button>
-    <button id="cancelUploadButton" onclick="cancelScreen()">Cancelar</button>
-  </div>
-  <p id="uploadMessage" class="muted"></p>
-  <progress id="uploadProgress" class="hidden" max="100" value="0" style="width:100%"></progress>
-</section>
-
-<section id="homePage">
-  <h2>Videos</h2>
+<section id="page-home">
+  <h2>Videos recientes</h2>
   <div id="videos" class="grid"></div>
-  <h2>Canales</h2>
-  <div id="channels" class="grid"></div>
-  <p id="empty" class="muted hidden">Todavía no hay videos ni canales.</p>
 </section>
 
-<section id="channelPage" class="hidden">
-  <button onclick="home()">← Volver</button>
-  <div class="panel">
-    <h2 id="channelTitle"></h2>
-    <p id="channelMeta" class="muted"></p>
-    <div class="actions">
-      <button id="channelSubscribeButton" class="subscribe-button hidden"
-        onclick="toggleSubscribeFromChannel()">Suscribirse</button>
-      <span id="channelSubscribeMessage" class="muted"></span>
-    </div>
+<section id="page-channels" class="hidden">
+  <div class="row">
+    <h2 class="grow">Canales</h2>
+    <button class="primary" onclick="showPage('create-channel')">Crear canal</button>
   </div>
+  <div id="channels" class="grid"></div>
+</section>
+
+<section id="page-channel" class="hidden">
+  <button onclick="showPage('channels')">← Canales</button>
+  <div id="channelInfo"></div>
   <div id="channelVideos" class="grid"></div>
 </section>
 
-<section id="videoPage" class="hidden">
+<section id="page-video" class="hidden">
   <button onclick="home()">← Volver</button>
+  <div id="videoInfo"></div>
+</section>
+
+<section id="page-account" class="hidden">
   <div class="panel">
-    <video id="player" class="player" controls playsinline></video>
-    <h2 id="videoTitle"></h2>
-    <p id="videoCreator" class="muted"></p>
-    <p id="videoDescription"></p>
-    <div class="actions">
-      <button id="likeButton" onclick="toggleLike()">♡ Me gusta</button>
-      <span id="likeCount" class="muted"></span>
+    <h2 id="accountTitle">Iniciar sesión</h2>
+    <input id="username" placeholder="Nombre de usuario" maxlength="24" autocomplete="username">
+    <input id="email" class="hidden" placeholder="Correo electrónico (opcional)" type="email">
+    <input id="password" placeholder="Contraseña" type="password" maxlength="128" autocomplete="current-password">
+    <button class="primary" id="authBtn" onclick="auth()">Entrar</button>
+    <button id="switchAuth" onclick="switchAuth()">Crear cuenta</button>
+    <div id="accountMessage" class="muted"></div>
+    <div id="loggedIn" class="hidden">
+      <p id="userLabel"></p>
+      <button onclick="logout()">Cerrar sesión</button>
     </div>
-    <div class="actions">
-      <button id="videoSubscribeButton" class="subscribe-button"
-        onclick="toggleSubscribeFromVideo()">Suscribirse</button>
-      <span id="videoSubscribeCount" class="muted"></span>
-    </div>
-    <p id="videoActionMessage" class="muted"></p>
+  </div>
+</section>
+
+<section id="page-upload" class="hidden">
+  <div class="panel">
+    <h2>Subir video</h2>
+    <p class="muted">
+      Formato MP4. Tamaño máximo: 50 MiB
+      (52,428,800 bytes) por video.
+    </p>
+    <input id="videoTitle" placeholder="Título" maxlength="120">
+    <textarea id="videoDescription" placeholder="Descripción" maxlength="5000"></textarea>
+    <select id="channelSelect"></select>
+    <input id="videoFile" type="file" accept="video/mp4,.mp4">
+    <p id="fileSize" class="muted">No has seleccionado ningún video.</p>
+    <button class="primary" id="uploadBtn" onclick="uploadVideo()">Subir video</button>
+    <p id="uploadMessage" class="muted"></p>
+    <progress id="uploadProgress" class="hidden" max="100" value="0" style="width:100%"></progress>
+  </div>
+</section>
+
+<section id="page-create-channel" class="hidden">
+  <div class="panel">
+    <h2>Crear canal</h2>
+    <input id="channelName" placeholder="Nombre del canal" maxlength="40">
+    <textarea id="channelDescription" placeholder="Descripción" maxlength="1000"></textarea>
+    <button class="primary" onclick="createChannel()">Crear canal</button>
   </div>
 </section>
 </main>
 
 <script>
-let user=null;
-let registerMode=true;
-let currentVideo=null;
-let currentChannel=null;
-let uploadBusy=false;
-let screenMode="home";
+const MAX_VIDEO_SIZE = 50 * 1024 * 1024;
+let me = null;
+let videos = [];
+let channels = [];
+let registering = false;
+let activeChannel = null;
+let uploading = false;
 
-const $=id=>document.getElementById(id);
-
-async function api(path,options={}){
-  const headers={...(options.headers||{})};
-  if(!(options.body instanceof FormData)){
-    headers["Content-Type"]="application/json";
-  }
-  const r=await fetch(path,{
-    credentials:"same-origin",
+async function api(path, options={}) {
+  const response = await fetch(path, {
+    credentials: "same-origin",
     ...options,
-    headers
+    headers: {
+      ...(options.headers || {}),
+      ...(options.body instanceof FormData ? {} : {"Content-Type":"application/json"})
+    }
   });
-  const d=await r.json().catch(()=>({error:"Respuesta no válida"}));
-  if(!r.ok)throw new Error(d.error||"Ocurrió un error");
-  return d;
+
+  let data = {};
+  try { data = await response.json(); } catch {}
+
+  if (!response.ok) {
+    throw new Error(data.error || "Error del servidor.");
+  }
+
+  return data;
 }
 
-function hideAllContent(){
-  ["auth","createPanel","uploadPanel","homePage","channelPage","videoPage"]
-    .forEach(id=>$(id).classList.add("hidden"));
+function msg(text) {
+  document.getElementById("status").textContent = text || "";
 }
 
-function showScreen(mode){
-  hideAllContent();
-  screenMode=mode;
-
-  if(mode==="auth")$("auth").classList.remove("hidden");
-  else if(mode==="create")$("createPanel").classList.remove("hidden");
-  else if(mode==="upload")$("uploadPanel").classList.remove("hidden");
-  else if(mode==="channel")$("channelPage").classList.remove("hidden");
-  else if(mode==="video")$("videoPage").classList.remove("hidden");
-  else $("homePage").classList.remove("hidden");
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;",
+    "<":"&lt;",
+    ">":"&gt;",
+    '"':"&quot;",
+    "'":"&#39;"
+  }[c]));
 }
 
-function showAuth(){
-  registerMode=true;
-  $("authTitle").textContent="Crear cuenta";
-  $("modeButton").textContent="Ya tengo cuenta";
-  $("authMessage").textContent="";
-  $("password").value="";
-  showScreen("auth");
+function showPage(name) {
+  document.querySelectorAll("main>section").forEach(section => {
+    section.classList.add("hidden");
+  });
+
+  const page = document.getElementById("page-" + name);
+  if (page) page.classList.remove("hidden");
+
+  msg("");
+
+  if (name === "channels") loadChannels();
+  if (name === "upload") fillChannelSelect();
+  if (name === "account") updateAccount();
 }
 
-function hideAuth(){
-  showScreen("home");
+function home() {
+  showPage("home");
+  loadVideos();
 }
 
-function cancelScreen(){
-  if(uploadBusy)return;
-  $("authMessage").textContent="";
-  $("channelMessage").textContent="";
-  $("uploadMessage").textContent="";
-  $("password").value="";
-  showHome();
-  history.pushState({page:"home"},"","/");
+function videoCard(v) {
+  return `<article class="card">
+    <video controls preload="metadata" src="${esc(v.url)}"></video>
+    <div class="cardbody">
+      <h3><a href="#" onclick="openVideo('${esc(v.id)}');return false">${esc(v.title)}</a></h3>
+      <p class="muted">
+        <a href="#" onclick="openChannel('${esc(v.channelId)}');return false">${esc(v.channel)}</a>
+      </p>
+      <div class="row">
+        <button onclick="likeVideo('${esc(v.id)}')">${v.liked ? "♥" : "♡"} ${v.likes}</button>
+        <span class="muted">${v.createdAt ? new Date(v.createdAt).toLocaleDateString() : ""}</span>
+      </div>
+    </div>
+  </article>`;
 }
 
-function toggleAuthMode(){
-  registerMode=!registerMode;
-  $("authTitle").textContent=registerMode?"Crear cuenta":"Iniciar sesión";
-  $("modeButton").textContent=registerMode?"Ya tengo cuenta":"Crear cuenta nueva";
-  $("authMessage").textContent="";
-  $("password").value="";
-}
-
-async function submitAuth(){
-  const msg=$("authMessage");
-  msg.className="muted";
-  try{
-    const d=await api(registerMode?"/api/register":"/api/login",{
-      method:"POST",
-      body:JSON.stringify({
-        username:$("username").value.trim(),
-        password:$("password").value
-      })
-    });
-    user=d.user;
-    $("password").value="";
-    updateUser();
-    history.pushState({page:"home"},"","/");
-    await showHome();
-  }catch(e){
-    msg.textContent=e.message;
-    msg.className="error";
+async function loadVideos() {
+  try {
+    videos = (await api("/api/videos")).videos || [];
+    render();
+  } catch (e) {
+    msg(e.message);
   }
 }
 
-async function logout(){
-  try{
-    await api("/api/logout",{method:"POST",body:"{}"});
-  }catch(e){}
-
-  user=null;
-  currentVideo=null;
-  currentChannel=null;
-
-  const player=$("player");
-  player.pause();
-  player.removeAttribute("src");
-  player.load();
-
-  updateUser();
-  showScreen("home");
-  history.pushState({page:"home"},"","/");
-  await showHome();
-}
-
-function updateUser(){
-  $("who").textContent=user?"@"+user.username:"Sin iniciar sesión";
-  $("authButton").classList.toggle("hidden",!!user);
-  $("logoutButton").classList.toggle("hidden",!user);
-  $("createButton").classList.toggle("hidden",!user);
-}
-
-function openCreate(){
-  if(!user){
-    showAuth();
-    return;
-  }
-  $("channelMessage").textContent="";
-  $("uploadMessage").textContent="";
-
-  if(!user.channel){
-    showScreen("create");
-  }else{
-    showScreen("upload");
-  }
-}
-
-async function loadMe(){
-  try{
-    user=(await api("/api/me")).user;
-  }catch(e){
-    user=null;
-  }
-  updateUser();
-}
-
-async function createChannel(){
-  const msg=$("channelMessage");
-  try{
-    const d=await api("/api/create-channel",{
-      method:"POST",
-      body:JSON.stringify({name:$("channelName").value.trim()})
-    });
-    user=d.user;
-    updateUser();
-    msg.textContent="¡Tu canal está listo!";
-    msg.className="success";
-    await showHome();
-    history.pushState({page:"home"},"","/");
-  }catch(e){
-    msg.textContent=e.message;
-    msg.className="error";
-  }
-}
-
-$("videoFile").addEventListener("change",()=>{
-  const f=$("videoFile").files[0];
-  $("fileName").textContent=f?
-    f.name+" ("+(f.size/1024/1024).toFixed(1)+" MB)":
-    "No has seleccionado ningún video.";
-});
-
-async function uploadVideo(){
-  if(uploadBusy)return;
-  if(!user){showAuth();return}
-  if(!user.channel){
-    showScreen("create");
-    return;
-  }
-
-  const file=$("videoFile").files[0];
-  const title=$("uploadTitle").value.trim();
-  const description=$("uploadDescription").value.trim();
-  const msg=$("uploadMessage");
-  const progress=$("uploadProgress");
-  const btn=$("uploadButton");
-
-  if(!file){msg.textContent="Selecciona un video MP4.";msg.className="error";return}
-  if(!file.name.toLowerCase().endsWith(".mp4")){
-    msg.textContent="El archivo debe terminar en .mp4.";
-    msg.className="error";return;
-  }
-  if(file.size===0){msg.textContent="El archivo está vacío.";msg.className="error";return}
-  if(file.size>500*1024*1024){
-    msg.textContent="El límite de tamaño es 500 MB.";
-    msg.className="error";return;
-  }
-  if(!title){msg.textContent="Escribe el título.";msg.className="error";return}
-
-  uploadBusy=true;
-  btn.disabled=true;
-  $("cancelUploadButton").disabled=true;
-  progress.classList.remove("hidden");
-  progress.value=0;
-  msg.textContent="Subiendo video...";
-  msg.className="muted";
-
-  const form=new FormData();
-  form.append("video",file);
-  form.append("title",title);
-  form.append("description",description);
-
-  try{
-    const result=await new Promise((resolve,reject)=>{
-      const xhr=new XMLHttpRequest();
-      xhr.open("POST","/api/upload");
-      xhr.withCredentials=true;
-      xhr.upload.onprogress=e=>{
-        if(e.lengthComputable)progress.value=Math.round(e.loaded/e.total*100);
-      };
-      xhr.onload=()=>{
-        let d={};
-        try{d=JSON.parse(xhr.responseText)}catch(e){}
-        if(xhr.status>=200&&xhr.status<300)resolve(d);
-        else reject(new Error(d.error||"No se pudo subir el video."));
-      };
-      xhr.onerror=()=>reject(new Error("Error de conexión durante la subida."));
-      xhr.send(form);
-    });
-
-    $("videoFile").value="";
-    $("uploadTitle").value="";
-    $("uploadDescription").value="";
-    $("fileName").textContent="No has seleccionado ningún video.";
-    msg.textContent="¡Video subido correctamente!";
-    msg.className="success";
-
-    await showHome();
-    await openVideo(result.video.channelFolder,result.video.folder);
-  }catch(e){
-    msg.textContent=e.message;
-    msg.className="error";
-  }finally{
-    uploadBusy=false;
-    btn.disabled=false;
-    $("cancelUploadButton").disabled=false;
-    setTimeout(()=>progress.classList.add("hidden"),1200);
-  }
-}
-
-function home(){
-  if(uploadBusy)return;
-  history.pushState({page:"home"},"","/");
-  showHome();
-}
-
-async function showHome(){
-  showScreen("home");
-  const vids=$("videos");
-  const chans=$("channels");
-  vids.innerHTML="";
-  chans.innerHTML="";
-  try{
-    const [vd,cd]=await Promise.all([
-      api("/api/videos"),
-      api("/api/channels")
-    ]);
-
-    for(const v of vd.videos){
-      const el=document.createElement("div");
-      el.className="video";
-      const thumb=document.createElement("video");
-      thumb.src=v.url;
-      thumb.muted=true;
-      thumb.preload="metadata";
-      const info=document.createElement("div");
-      info.className="info";
-      const title=document.createElement("strong");
-      title.textContent=v.title;
-      const creator=document.createElement("p");
-      creator.className="muted";
-      creator.textContent=v.channel+" · "+v.likes+" Me gusta";
-      info.append(title,creator);
-      el.append(thumb,info);
-      el.onclick=()=>openVideo(v.channelFolder,v.folder);
-      vids.append(el);
-    }
-
-    for(const c of cd.channels){
-      const el=document.createElement("div");
-      el.className="panel";
-      const title=document.createElement("strong");
-      title.textContent=c.name;
-      const meta=document.createElement("p");
-      meta.className="muted";
-      meta.textContent=c.subscribers+" suscriptores";
-      const btn=document.createElement("button");
-      btn.textContent="Ver canal";
-      btn.onclick=()=>openChannel(c.folder);
-      el.append(title,meta,btn);
-      chans.append(el);
-    }
-
-    $("empty").classList.toggle("hidden",vd.videos.length+cd.channels.length>0);
-  }catch(e){
-    vids.textContent="Error: "+e.message;
-  }
-  updateUser();
-}
-
-function setSubscribeButton(button,subscribed){
-  button.textContent=subscribed?"Suscrito":"Suscribirse";
-  button.classList.toggle("subscribed",subscribed);
-}
-
-async function openChannel(folder,push=true){
-  if(push){
-    history.pushState({page:"channel",folder},"","/"+encodeURIComponent(folder));
-  }
-  showScreen("channel");
-  currentChannel=folder;
-
-  const subButton=$("channelSubscribeButton");
-  const subMessage=$("channelSubscribeMessage");
-  subMessage.textContent="";
-  subButton.classList.add("hidden");
-
-  try{
-    const d=await api("/api/channel?name="+encodeURIComponent(folder));
-    currentChannel=d.channel.folder;
-    $("channelTitle").textContent=d.channel.name;
-    $("channelMeta").textContent=d.channel.subscribers+" suscriptores";
-
-    if(user && d.channel.owner!==user.username){
-      subButton.classList.remove("hidden");
-      setSubscribeButton(subButton,d.channel.subscribed);
-    }
-
-    const box=$("channelVideos");
-    box.innerHTML="";
-    for(const v of d.videos){
-      const el=document.createElement("div");
-      el.className="video";
-      const thumb=document.createElement("video");
-      thumb.src=v.url;
-      thumb.muted=true;
-      thumb.preload="metadata";
-      const info=document.createElement("div");
-      info.className="info";
-      const title=document.createElement("strong");
-      title.textContent=v.title;
-      const desc=document.createElement("p");
-      desc.className="muted";
-      desc.textContent=v.description;
-      info.append(title,desc);
-      el.append(thumb,info);
-      el.onclick=()=>openVideo(v.channelFolder,v.folder);
-      box.append(el);
-    }
-  }catch(e){
-    $("channelTitle").textContent=e.message;
-  }
-}
-
-async function toggleSubscribe(channelFolder,button,countElement,messageElement){
-  if(!user){showAuth();return}
-  if(!channelFolder)return;
-
-  button.disabled=true;
-  if(messageElement)messageElement.textContent="";
-  try{
-    const d=await api("/api/toggle-subscribe",{
-      method:"POST",
-      body:JSON.stringify({channel:channelFolder})
-    });
-    setSubscribeButton(button,d.subscribed);
-    if(countElement)countElement.textContent=d.subscribers+" suscriptores";
-
-    if(currentChannel===channelFolder){
-      $("channelMeta").textContent=d.subscribers+" suscriptores";
-    }
-
-    if(currentVideo && currentVideo.channelFolder===channelFolder){
-      currentVideo.subscribed=d.subscribed;
-      currentVideo.subscribers=d.subscribers;
-      $("videoSubscribeCount").textContent=d.subscribers+" suscriptores";
-    }
-
-    if(messageElement){
-      messageElement.textContent=d.subscribed?
-        "¡Te has suscrito al canal!":"Has cancelado la suscripción.";
-      messageElement.className="muted success";
-    }
-  }catch(e){
-    if(messageElement){
-      messageElement.textContent=e.message;
-      messageElement.className="error";
-    }else{
-      alert(e.message);
-    }
-  }finally{
-    button.disabled=false;
-  }
-}
-
-function toggleSubscribeFromChannel(){
-  toggleSubscribe(currentChannel,$("channelSubscribeButton"),null,$("channelSubscribeMessage"));
-}
-
-function toggleSubscribeFromVideo(){
-  if(!currentVideo)return;
-  toggleSubscribe(
-    currentVideo.channelFolder,
-    $("videoSubscribeButton"),
-    $("videoSubscribeCount"),
-    $("videoActionMessage")
+function render() {
+  const q = (document.getElementById("search").value || "").toLowerCase();
+  const filtered = videos.filter(v =>
+    (v.title + " " + v.channel + " " + v.description).toLowerCase().includes(q)
   );
+
+  document.getElementById("videos").innerHTML =
+    filtered.map(videoCard).join("") ||
+    '<p class="muted">Todavía no hay videos.</p>';
 }
 
-async function openVideo(channel,folder,push=true){
-  if(push){
-    history.pushState(
-      {page:"video",channel,folder},
-      "",
-      "/"+encodeURIComponent(channel)+"/"+encodeURIComponent(folder)
-    );
-  }
-  showScreen("video");
-  $("videoActionMessage").textContent="";
-  currentVideo=null;
+async function loadChannels() {
+  try {
+    channels = (await api("/api/channels")).channels || [];
 
-  try{
-    const d=await api(
-      "/api/video?channel="+encodeURIComponent(channel)+
-      "&video="+encodeURIComponent(folder)
-    );
-    currentVideo=d.video;
-    $("player").src=d.video.url;
-    $("videoTitle").textContent=d.video.title;
-    $("videoCreator").textContent=d.video.channel;
-    $("videoDescription").textContent=d.video.description||"";
-    $("likeCount").textContent=d.video.likes+" Me gusta";
-    $("likeButton").textContent=d.video.liked?"♥ Te gusta":"♡ Me gusta";
+    document.getElementById("channels").innerHTML = channels.map(c =>
+      `<article class="card"><div class="cardbody">
+        <h3>${esc(c.name)}</h3>
+        <p class="muted">${esc(c.description)}</p>
+        <p class="muted">Creado por ${esc(c.owner)} · ${c.subscribers} suscriptores</p>
+        <button class="primary" onclick="openChannel('${esc(c.id)}')">Ver canal</button>
+      </div></article>`
+    ).join("") || '<p class="muted">Aún no hay canales.</p>';
 
-    const subButton=$("videoSubscribeButton");
-    $("videoSubscribeCount").textContent=d.video.subscribers+" suscriptores";
-
-    if(user && d.video.channelOwner===user.username){
-      subButton.classList.add("hidden");
-    }else{
-      subButton.classList.remove("hidden");
-      setSubscribeButton(subButton,d.video.subscribed);
-    }
-  }catch(e){
-    $("videoTitle").textContent=e.message;
+    fillChannelSelect();
+  } catch (e) {
+    msg(e.message);
   }
 }
 
-async function toggleLike(){
-  if(!user){showAuth();return}
-  if(!currentVideo)return;
-  const btn=$("likeButton");
-  btn.disabled=true;
-  try{
-    const d=await api("/api/toggle-like",{
+async function openChannel(id) {
+  try {
+    const c = (await api("/api/channel?id=" + encodeURIComponent(id))).channel;
+    activeChannel = c;
+    showPage("channel");
+
+    document.getElementById("channelInfo").innerHTML =
+      `<h2>${esc(c.name)}</h2>
+       <p>${esc(c.description)}</p>
+       <p class="muted">Propietario: ${esc(c.owner)} · ${c.subscribers} suscriptores</p>
+       <button class="primary" onclick="subscribe('${esc(c.id)}')">
+       ${c.subscribed ? "Cancelar suscripción" : "Suscribirse"}</button>`;
+
+    document.getElementById("channelVideos").innerHTML =
+      (c.videos || []).map(videoCard).join("") ||
+      '<p class="muted">Este canal aún no tiene videos.</p>';
+  } catch (e) {
+    msg(e.message);
+  }
+}
+
+async function openVideo(id) {
+  try {
+    const v = (await api("/api/video?id=" + encodeURIComponent(id))).video;
+    showPage("video");
+
+    document.getElementById("videoInfo").innerHTML =
+      `<h2>${esc(v.title)}</h2>
+       <video class="big" controls autoplay src="${esc(v.url)}"></video>
+       <p><a href="#" onclick="openChannel('${esc(v.channelId)}');return false">${esc(v.channel)}</a></p>
+       <p>${esc(v.description)}</p>
+       <button onclick="likeVideo('${esc(v.id)}')">${v.liked ? "♥" : "♡"} ${v.likes} Me gusta</button>`;
+  } catch (e) {
+    msg(e.message);
+  }
+}
+
+async function likeVideo(id) {
+  if (!me) {
+    showPage("account");
+    msg("Inicia sesión para dar Me gusta.");
+    return;
+  }
+
+  try {
+    await api("/api/toggle-like", {
+      method: "POST",
+      body: JSON.stringify({videoId:id})
+    });
+
+    await loadVideos();
+
+    if (activeChannel) await openChannel(activeChannel.id);
+  } catch (e) {
+    msg(e.message);
+  }
+}
+
+async function subscribe(id) {
+  if (!me) {
+    showPage("account");
+    msg("Inicia sesión para suscribirte.");
+    return;
+  }
+
+  try {
+    await api("/api/toggle-subscribe", {
+      method: "POST",
+      body: JSON.stringify({channelId:id})
+    });
+
+    await openChannel(id);
+    await loadChannels();
+  } catch (e) {
+    msg(e.message);
+  }
+}
+
+function switchAuth() {
+  registering = !registering;
+
+  document.getElementById("accountTitle").textContent =
+    registering ? "Crear cuenta" : "Iniciar sesión";
+
+  document.getElementById("authBtn").textContent =
+    registering ? "Registrarse" : "Entrar";
+
+  document.getElementById("switchAuth").textContent =
+    registering ? "Ya tengo cuenta" : "Crear cuenta";
+
+  document.getElementById("email").classList.toggle("hidden", !registering);
+  document.getElementById("password").autocomplete =
+    registering ? "new-password" : "current-password";
+}
+
+async function auth() {
+  const username = document.getElementById("username").value.trim();
+  const password = document.getElementById("password").value;
+  const email = document.getElementById("email").value.trim();
+
+  try {
+    const result = await api(registering ? "/api/register" : "/api/login", {
+      method: "POST",
+      body: JSON.stringify({username, password, email})
+    });
+
+    me = result.user;
+    updateAccount();
+    msg("Sesión iniciada.");
+    home();
+  } catch (e) {
+    document.getElementById("accountMessage").textContent = e.message;
+  }
+}
+
+function updateAccount() {
+  document.getElementById("accountBtn").textContent = me ? me.username : "Entrar";
+  document.getElementById("loggedIn").classList.toggle("hidden", !me);
+  document.getElementById("userLabel").textContent =
+    me ? "Sesión iniciada como " + me.username : "";
+
+  document.getElementById("authBtn").classList.toggle("hidden", !!me);
+  document.getElementById("switchAuth").classList.toggle("hidden", !!me);
+  document.getElementById("username").classList.toggle("hidden", !!me);
+  document.getElementById("password").classList.toggle("hidden", !!me);
+  document.getElementById("email").classList.add("hidden");
+  document.getElementById("accountMessage").textContent = "";
+}
+
+async function logout() {
+  try {
+    await api("/api/logout", {method:"POST", body:"{}"});
+    me = null;
+    updateAccount();
+    home();
+  } catch (e) {
+    msg(e.message);
+  }
+}
+
+async function createChannel() {
+  try {
+    const result = await api("/api/create-channel", {
       method:"POST",
       body:JSON.stringify({
-        channel:currentVideo.channelFolder,
-        video:currentVideo.folder
+        name:document.getElementById("channelName").value.trim(),
+        description:document.getElementById("channelDescription").value.trim()
       })
     });
-    currentVideo.likes=d.likes;
-    currentVideo.liked=d.liked;
-    $("likeCount").textContent=d.likes+" Me gusta";
-    btn.textContent=d.liked?"♥ Te gusta":"♡ Me gusta";
-  }catch(e){
-    alert(e.message);
-  }finally{
-    btn.disabled=false;
+
+    msg("Canal creado.");
+    await loadChannels();
+    await openChannel(result.channel.id);
+  } catch (e) {
+    msg(e.message);
   }
 }
 
-window.addEventListener("popstate",()=>{
-  const p=decodeURIComponent(location.pathname).split("/").filter(Boolean);
-  if(!p.length)showHome();
-  else if(p.length===1)openChannel(p[0],false);
-  else openVideo(p[0],p.slice(1).join("/"),false);
+async function fillChannelSelect() {
+  const select = document.getElementById("channelSelect");
+
+  if (!me) {
+    select.innerHTML = '<option value="">Inicia sesión primero</option>';
+    return;
+  }
+
+  try {
+    channels = (await api("/api/my-channels")).channels || [];
+
+    select.innerHTML = channels.map(c =>
+      `<option value="${esc(c.id)}">${esc(c.name)}</option>`
+    ).join("");
+
+    if (!channels.length) {
+      select.innerHTML = '<option value="">Primero crea un canal</option>';
+    }
+  } catch (e) {
+    msg(e.message);
+  }
+}
+
+/* Mostrar tamaño del archivo y comprobar el límite al seleccionarlo. */
+document.getElementById("videoFile").addEventListener("change", function() {
+  const file = this.files[0];
+  const output = document.getElementById("fileSize");
+  const uploadBtn = document.getElementById("uploadBtn");
+
+  if (!file) {
+    output.textContent = "No has seleccionado ningún video.";
+    uploadBtn.disabled = false;
+    return;
+  }
+
+  output.textContent =
+    "Tamaño: " + file.size.toLocaleString("es-MX") +
+    " bytes (" + (file.size / (1024 * 1024)).toFixed(2) + " MiB).";
+
+  if (file.size > MAX_VIDEO_SIZE) {
+    output.textContent += " RECHAZADO: supera el máximo de 50 MiB.";
+    uploadBtn.disabled = true;
+  } else {
+    output.textContent += " Tamaño permitido.";
+    uploadBtn.disabled = false;
+  }
 });
 
-(async()=>{
-  await loadMe();
-  const p=decodeURIComponent(location.pathname).split("/").filter(Boolean);
-  if(!p.length)await showHome();
-  else if(p.length===1)await openChannel(p[0],false);
-  else await openVideo(p[0],p.slice(1).join("/"),false);
-})();
+async function uploadVideo() {
+  if (uploading) return;
+
+  const file = document.getElementById("videoFile").files[0];
+  const title = document.getElementById("videoTitle").value.trim();
+  const description = document.getElementById("videoDescription").value.trim();
+  const channelId = document.getElementById("channelSelect").value;
+  const output = document.getElementById("uploadMessage");
+  const progress = document.getElementById("uploadProgress");
+  const button = document.getElementById("uploadBtn");
+
+  if (!me) {
+    output.textContent = "Inicia sesión primero.";
+    return;
+  }
+
+  if (!channelId) {
+    output.textContent = "Crea un canal primero.";
+    return;
+  }
+
+  if (!file || !title) {
+    output.textContent = "Escribe un título y selecciona un MP4.";
+    return;
+  }
+
+  if (!file.name.toLowerCase().endsWith(".mp4")) {
+    output.textContent = "Solo se permiten archivos MP4.";
+    return;
+  }
+
+  /*
+   * VALIDACIÓN EXACTA EN EL NAVEGADOR:
+   * 52,428,800 bytes: permitido.
+   * 52,428,801 bytes: rechazado.
+   */
+  if (file.size > MAX_VIDEO_SIZE) {
+    output.textContent =
+      "No se puede subir: el máximo es 50 MiB (52,428,800 bytes).";
+    button.disabled = true;
+    return;
+  }
+
+  const data = new FormData();
+  data.append("title", title);
+  data.append("description", description);
+  data.append("channelId", channelId);
+  data.append("video", file);
+
+  uploading = true;
+  button.disabled = true;
+  output.textContent = "Preparando subida...";
+  progress.classList.remove("hidden");
+  progress.value = 0;
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/upload");
+  xhr.withCredentials = true;
+
+  xhr.upload.onprogress = event => {
+    if (event.lengthComputable) {
+      progress.value = event.loaded / event.total * 100;
+      output.textContent =
+        "Subiendo video: " + Math.round(progress.value) + "%";
+    }
+  };
+
+  xhr.onload = async () => {
+    let result = {};
+    try {
+      result = JSON.parse(xhr.responseText);
+    } catch {}
+
+    uploading = false;
+    button.disabled = false;
+    progress.classList.add("hidden");
+
+    if (xhr.status >= 200 && xhr.status < 300) {
+      output.textContent = "¡Video subido correctamente!";
+      document.getElementById("videoTitle").value = "";
+      document.getElementById("videoDescription").value = "";
+      document.getElementById("videoFile").value = "";
+      document.getElementById("fileSize").textContent =
+        "No has seleccionado ningún video.";
+
+      await loadVideos();
+      showPage("home");
+    } else {
+      output.textContent = result.error || "No se pudo subir el video.";
+    }
+  };
+
+  xhr.onerror = () => {
+    uploading = false;
+    button.disabled = false;
+    progress.classList.add("hidden");
+    output.textContent = "Error de conexión al subir el video.";
+  };
+
+  xhr.send(data);
+}
+
+async function start() {
+  try {
+    const result = await api("/api/me");
+    me = result.user || null;
+  } catch {
+    me = null;
+  }
+
+  updateAccount();
+  await loadVideos();
+}
+
+start();
 </script>
 </body>
-</html>
-"""
+</html>'''
 
-def read_json(path, default=None):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return default if default is not None else {}
-
-def write_json(path, data):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    tmp.replace(path)
-
-def load_users():
-    data = read_json(USERS_FILE, {})
-    return data if isinstance(data, dict) else {}
-
-def safe_name(name):
-    name = str(name or "").strip()
-    if not name or len(name) > 40 or name in (".", ".."):
-        return None
-    if not re.fullmatch(r"[\w .-]+", name, flags=re.UNICODE):
-        return None
-    return name
-
-def folder_for_channel(name):
-    if not name or name in (".", "..") or "/" in name or "\\" in name:
-        return None
-    p = (CHANNELS / name).resolve()
-    return p if p.parent == CHANNELS.resolve() else None
-
-def find_video(channel_name, video_name):
-    channel = folder_for_channel(channel_name)
-    if channel is None or not channel.is_dir():
-        return None, None
-    if not video_name or "/" in video_name or "\\" in video_name or video_name in (".", ".."):
-        return None, None
-    folder = (channel / video_name).resolve()
-    if folder.parent != channel.resolve() or not folder.is_dir():
-        return None, None
-    if not (folder / "info.json").is_file() or not (folder / "video.mp4").is_file():
-        return None, None
-    return folder, read_json(folder / "info.json", {})
-
-def subscriber_list(info):
-    users = info.get("_subscribed_by", [])
-    if not isinstance(users, list):
-        users = []
-    return list(dict.fromkeys(str(u) for u in users if u))
-
-def video_data(channel_name, video_name):
-    folder, info = find_video(channel_name, video_name)
-    if folder is None:
-        return None
-
-    channel_folder = folder_for_channel(channel_name)
-    channel_info = read_json(channel_folder / "info.json", {}) if channel_folder else {}
-
-    return {
-        "title": str(info.get("title", folder.name)),
-        "description": str(info.get("description", "")),
-        "likes": max(0, int(info.get("likes", 0) or 0)),
-        "channel": str(channel_info.get("name", channel_name)),
-        "channelFolder": channel_name,
-        "channelOwner": channel_info.get("owner"),
-        "subscribers": len(subscriber_list(channel_info)),
-        "folder": folder.name,
-        "url": "/media/" + quote(channel_name, safe="") + "/" +
-               quote(folder.name, safe="") + "/video.mp4"
-    }
-
-def list_channels():
-    result = []
-    for p in sorted(CHANNELS.iterdir(), key=lambda x: x.name.lower()):
-        if p.is_dir():
-            info = read_json(p / "info.json", {})
-            result.append({
-                "name": str(info.get("name", p.name)),
-                "folder": p.name,
-                "subscribers": len(subscriber_list(info))
-            })
-    return result
-
-def list_videos(channel_filter=None):
-    result = []
-    for c in sorted(CHANNELS.iterdir(), key=lambda x: x.name.lower()):
-        if not c.is_dir() or (channel_filter and c.name != channel_filter):
-            continue
-        for v in sorted(c.iterdir(), key=lambda x: x.name.lower()):
-            if v.is_dir():
-                data = video_data(c.name, v.name)
-                if data:
-                    result.append(data)
-    return result
-
-def hash_password(password, salt=None):
-    salt = salt or secrets.token_hex(16)
-    hashed = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), bytes.fromhex(salt), 250000
-    )
-    return salt, hashed.hex()
-
-def public_user(username, data):
-    return {"username": username, "channel": data.get("channel")}
-
-SESSIONS = {}
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PouPlay/2.3"
+    server_version = "PouPlay/3.0"
 
     def log_message(self, fmt, *args):
-        print("[PouPlay]", fmt % args)
+        logging.info("%s - %s", self.address_string(), fmt % args)
 
-    def send_bytes(self, code, data, content_type="application/json; charset=utf-8", extra=None):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("X-Content-Type-Options", "nosniff")
+    def send_json(self, status, data, extra_headers=None):
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
-        if extra:
-            for k, v in extra.items():
-                self.send_header(k, v)
+
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
+
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(raw)
 
-    def json_response(self, code, obj, extra=None):
-        self.send_bytes(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), extra=extra)
+    def read_json(self):
+        length = int(self.headers.get("Content-Length", "0"))
 
-    def body_json(self):
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length < 0 or length > 100000:
-                return {}
-            return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-        except (ValueError, UnicodeDecodeError):
-            return {}
+        if length > 1024 * 1024:
+            raise ValueError("Solicitud demasiado grande.")
 
-    def current_user(self):
-        token = None
-        for part in self.headers.get("Cookie", "").split(";"):
-            if part.strip().startswith("pouplay_session="):
-                token = part.strip().split("=", 1)[1]
-        username = SESSIONS.get(token)
-        users = load_users()
-        if username and username in users:
-            return username, users[username]
-        return None, None
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8") or "{}")
+
+    def current_username(self):
+        cookie = SimpleCookie()
+        cookie.load(self.headers.get("Cookie", ""))
+        morsel = cookie.get(SESSION_COOKIE)
+
+        if not morsel:
+            return None
+
+        return SESSIONS.get(morsel.value)
 
     def require_user(self):
-        username, account = self.current_user()
+        username = self.current_username()
+
         if not username:
-            self.json_response(401, {"error": "Inicia sesión primero."})
-            return None, None
-        return username, account
+            self.send_json(401, {"error": "Inicia sesión primero."})
+            return None
+
+        return username
+
+    def cookie_header(self, token, max_age):
+        secure = (
+            self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+        )
+
+        value = (
+            f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; "
+            f"SameSite=Lax; Max-Age={max_age}"
+        )
+
+        if secure:
+            value += "; Secure"
+
+        return value
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = unquote(parsed.path)
-        query = parse_qs(parsed.query)
+        path = urlparse(self.path).path
+        username = self.current_username()
 
-        if path == "/api/me":
-            u, a = self.current_user()
-            return self.json_response(200, {"user": public_user(u, a) if u else None})
+        try:
+            if path in ("/", "/index.html"):
+                body = HTML.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
 
-        if path == "/api/channels":
-            return self.json_response(200, {"channels": list_channels()})
+            if path == "/api/me":
+                user = get_user_by_name(username) if username else None
 
-        if path == "/api/videos":
-            return self.json_response(200, {"videos": list_videos()})
+                return self.send_json(200, {
+                    "user": {"username": user["username"]} if user else None
+                })
 
-        if path == "/api/channel":
-            name = query.get("name", [""])[0]
-            folder = folder_for_channel(name)
-            if folder is None or not folder.is_dir():
-                return self.json_response(404, {"error": "Canal no encontrado."})
+            if path == "/api/channels":
+                rows = (
+                    db("channels")
+                    .select("*")
+                    .order("created_at", desc=True)
+                    .execute()
+                    .data or []
+                )
 
-            info = read_json(folder / "info.json", {})
-            username, _ = self.current_user()
-            subs = subscriber_list(info)
+                result = []
 
-            return self.json_response(200, {
-                "channel": {
-                    "name": str(info.get("name", folder.name)),
-                    "folder": folder.name,
-                    "owner": info.get("owner"),
-                    "subscribers": len(subs),
-                    "subscribed": bool(username and username in subs)
-                },
-                "videos": list_videos(folder.name)
+                for channel in rows:
+                    subs = (
+                        db("subscriptions")
+                        .select("id")
+                        .eq("channel_id", channel["id"])
+                        .execute()
+                        .data or []
+                    )
+
+                    result.append({
+                        "id": channel["id"],
+                        "name": channel["name"],
+                        "description": channel.get("description", ""),
+                        "owner": channel["owner_username"],
+                        "subscribers": len(subs)
+                    })
+
+                return self.send_json(200, {"channels": result})
+
+            if path == "/api/my-channels":
+                if not username:
+                    return self.send_json(401, {
+                        "error": "Inicia sesión."
+                    })
+
+                rows = (
+                    db("channels")
+                    .select("*")
+                    .eq("owner_username", username)
+                    .order("created_at", desc=True)
+                    .execute()
+                    .data or []
+                )
+
+                return self.send_json(200, {"channels": rows})
+
+            if path == "/api/channel":
+                channel_id = parse_qs(
+                    urlparse(self.path).query
+                ).get("id", [""])[0]
+
+                channel = get_channel(channel_id)
+
+                if not channel:
+                    return self.send_json(404, {
+                        "error": "Canal no encontrado."
+                    })
+
+                return self.send_json(200, {
+                    "channel": channel_data(channel, username)
+                })
+
+            if path == "/api/videos":
+                rows = (
+                    db("videos")
+                    .select("*")
+                    .order("created_at", desc=True)
+                    .execute()
+                    .data or []
+                )
+
+                return self.send_json(200, {
+                    "videos": [video_data(v, username) for v in rows]
+                })
+
+            if path == "/api/video":
+                video_id = parse_qs(
+                    urlparse(self.path).query
+                ).get("id", [""])[0]
+
+                video = get_video(video_id)
+
+                if not video:
+                    return self.send_json(404, {
+                        "error": "Video no encontrado."
+                    })
+
+                return self.send_json(200, {
+                    "video": video_data(video, username)
+                })
+
+            return self.send_json(404, {"error": "Ruta no encontrada."})
+
+        except Exception:
+            logging.exception("Error en GET %s", path)
+
+            return self.send_json(500, {
+                "error": "Error interno. Revisa los registros de Render."
             })
-
-        if path == "/api/video":
-            channel = query.get("channel", [""])[0]
-            video = query.get("video", [""])[0]
-            data = video_data(channel, video)
-            if not data:
-                return self.json_response(404, {"error": "Video no encontrado."})
-
-            username, _ = self.current_user()
-            _, info = find_video(channel, video)
-            liked_by = info.get("_liked_by", [])
-            data["liked"] = bool(username and isinstance(liked_by, list) and username in liked_by)
-
-            channel_folder = folder_for_channel(channel)
-            channel_info = read_json(channel_folder / "info.json", {}) if channel_folder else {}
-            subs = subscriber_list(channel_info)
-            data["subscribed"] = bool(username and username in subs)
-
-            return self.json_response(200, {"video": data})
-
-        if path.startswith("/media/"):
-            parts = path[len("/media/"):].split("/")
-            if len(parts) != 3 or parts[2] != "video.mp4":
-                return self.json_response(404, {"error": "Archivo no encontrado."})
-
-            folder, _ = find_video(parts[0], parts[1])
-            if folder is None:
-                return self.json_response(404, {"error": "Video no encontrado."})
-
-            media = folder / "video.mp4"
-            size = media.stat().st_size
-            start, end, status = 0, size - 1, 200
-            rh = self.headers.get("Range")
-
-            if rh:
-                m = re.match(r"bytes=(\d*)-(\d*)$", rh.strip())
-                if m:
-                    if m.group(1):
-                        start = int(m.group(1))
-                    if m.group(2):
-                        end = int(m.group(2))
-                    if not m.group(1) and m.group(2):
-                        start = max(0, size - int(m.group(2)))
-                    end = min(end, size - 1)
-                    if start >= size or start > end:
-                        return self.send_bytes(416, b"", extra={"Content-Range": f"bytes */{size}"})
-                    status = 206
-
-            length = end - start + 1
-            self.send_response(status)
-            self.send_header("Content-Type", "video/mp4")
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Length", str(length))
-            self.send_header("X-Content-Type-Options", "nosniff")
-            if status == 206:
-                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-            self.end_headers()
-
-            with open(media, "rb") as f:
-                f.seek(start)
-                remaining = length
-                while remaining:
-                    chunk = f.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-            return
-
-        self.send_bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_POST(self):
         path = urlparse(self.path).path
 
-        if path == "/api/upload":
-            username, account = self.require_user()
-            if not username:
-                return
+        try:
+            if path == "/api/register":
+                data = self.read_json()
 
-            channel_name = account.get("channel")
-            channel = folder_for_channel(channel_name)
-            if not channel_name or channel is None or not channel.is_dir():
-                return self.json_response(400, {"error": "Primero crea tu canal."})
+                username = str(data.get("username", "")).strip()
+                password = str(data.get("password", ""))
+                email = str(data.get("email", "")).strip() or None
 
-            info = read_json(channel / "info.json", {})
-            if info.get("owner") != username:
-                return self.json_response(403, {"error": "Este canal no pertenece a tu cuenta."})
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{3,24}", username):
+                    return self.send_json(400, {
+                        "error": "El usuario debe tener entre 3 y 24 caracteres."
+                    })
 
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                length = 0
+                if not 6 <= len(password) <= 128:
+                    return self.send_json(400, {
+                        "error": "La contraseña debe tener entre 6 y 128 caracteres."
+                    })
 
-            if length <= 0:
-                return self.json_response(400, {"error": "No se recibió ningún archivo."})
-            if length > MAX_VIDEO_SIZE + 1024 * 1024:
-                return self.json_response(413, {"error": "El límite de subida es 500 MB."})
+                if email and (
+                    len(email) > 254 or not re.fullmatch(
+                        r"[^@\s]+@[^@\s]+\.[^@\s]+", email
+                    )
+                ):
+                    return self.send_json(400, {
+                        "error": "Correo electrónico no válido."
+                    })
 
-            content_type = self.headers.get("Content-Type", "")
-            if "multipart/form-data" not in content_type.lower():
-                return self.json_response(400, {"error": "Solicitud de subida no válida."})
+                if get_user_by_name(username):
+                    return self.send_json(409, {
+                        "error": "Ese usuario ya existe."
+                    })
 
-            raw = self.rfile.read(length)
-            try:
-                message = BytesParser(policy=default).parsebytes(
-                    b"Content-Type: " + content_type.encode("ascii") +
-                    b"\r\nMIME-Version: 1.0\r\n\r\n" + raw
-                )
-                fields = {}
-                uploaded = None
-                for part in message.iter_parts():
-                    name = part.get_param("name", header="content-disposition")
-                    payload = part.get_payload(decode=True) or b""
-                    if name == "video":
-                        uploaded = (part.get_filename() or "", payload)
-                    elif name in ("title", "description"):
-                        fields[name] = payload.decode("utf-8", errors="replace")
-            except Exception:
-                return self.json_response(400, {"error": "No se pudo leer el formulario."})
+                salt = secrets.token_hex(16)
 
-            if not uploaded:
-                return self.json_response(400, {"error": "Selecciona un archivo MP4."})
+                record = {
+                    "username": username,
+                    "email": email,
+                    "password_hash": password_hash(password, salt),
+                    "password_salt": salt
+                }
 
-            filename, video_bytes = uploaded
-            title = fields.get("title", "").strip()
-            description = fields.get("description", "").strip()
+                db("app_users").insert(record).execute()
 
-            if not filename.lower().endswith(".mp4"):
-                return self.json_response(400, {"error": "Solo se aceptan archivos .mp4."})
-            if not video_bytes:
-                return self.json_response(400, {"error": "El video está vacío."})
-            if len(video_bytes) > MAX_VIDEO_SIZE:
-                return self.json_response(413, {"error": "El límite de subida es 500 MB."})
-            if not title or len(title) > 120:
-                return self.json_response(400, {"error": "El título es obligatorio y debe tener máximo 120 caracteres."})
-            if len(description) > 5000:
-                return self.json_response(400, {"error": "La descripción supera los 5000 caracteres."})
+                token = secrets.token_urlsafe(32)
+                SESSIONS[token] = username
 
-            slug = re.sub(r"[^\w-]+", "-", title, flags=re.UNICODE).strip("-")[:45] or "video"
-            video_folder = channel / (slug + "-" + secrets.token_hex(4))
-            video_folder.mkdir()
-
-            try:
-                (video_folder / "video.mp4").write_bytes(video_bytes)
-                write_json(video_folder / "info.json", {
-                    "title": title,
-                    "description": description,
-                    "likes": 0,
-                    "_liked_by": [],
-                    "owner": username
+                return self.send_json(201, {
+                    "user": {"username": username}
+                }, {
+                    "Set-Cookie": self.cookie_header(
+                        token, 60 * 60 * 24 * 30
+                    )
                 })
-            except Exception:
-                import shutil
-                shutil.rmtree(video_folder, ignore_errors=True)
-                return self.json_response(500, {"error": "No se pudo guardar el video."})
 
-            return self.json_response(201, {"ok": True, "video": video_data(channel_name, video_folder.name)})
+            if path == "/api/login":
+                data = self.read_json()
 
-        data = self.body_json()
+                username = str(data.get("username", "")).strip()
+                password = str(data.get("password", ""))
 
-        if path == "/api/register":
-            username = str(data.get("username", "")).strip()
-            password = str(data.get("password", ""))
+                user = get_user_by_name(username)
 
-            if not re.fullmatch(r"[A-Za-z0-9_.-]{3,24}", username):
-                return self.json_response(400, {"error": "El usuario debe tener entre 3 y 24 caracteres."})
-            if len(password) < 6 or len(password) > 128:
-                return self.json_response(400, {"error": "La contraseña debe tener entre 6 y 128 caracteres."})
+                if not user or not hmac.compare_digest(
+                    user["password_hash"],
+                    password_hash(password, user["password_salt"])
+                ):
+                    return self.send_json(401, {
+                        "error": "Usuario o contraseña incorrectos."
+                    })
 
-            users = load_users()
-            if any(u.lower() == username.lower() for u in users):
-                return self.json_response(409, {"error": "Ese usuario ya existe."})
+                token = secrets.token_urlsafe(32)
+                SESSIONS[token] = user["username"]
 
-            salt, hashed = hash_password(password)
-            users[username] = {"salt": salt, "password_hash": hashed, "channel": None}
-            write_json(USERS_FILE, users)
+                return self.send_json(200, {
+                    "user": {"username": user["username"]}
+                }, {
+                    "Set-Cookie": self.cookie_header(
+                        token, 60 * 60 * 24 * 30
+                    )
+                })
 
-            token = secrets.token_urlsafe(32)
-            SESSIONS[token] = username
-            return self.json_response(
-                201, {"user": public_user(username, users[username])},
-                {"Set-Cookie": f"pouplay_session={token}; HttpOnly; SameSite=Lax; Path=/"}
-            )
+            if path == "/api/logout":
+                cookie = SimpleCookie()
+                cookie.load(self.headers.get("Cookie", ""))
+                morsel = cookie.get(SESSION_COOKIE)
 
-        if path == "/api/login":
-            username = str(data.get("username", "")).strip()
-            password = str(data.get("password", ""))
-            users = load_users()
-            real_name = next((u for u in users if u.lower() == username.lower()), None)
+                if morsel:
+                    SESSIONS.pop(morsel.value, None)
 
-            if not real_name:
-                return self.json_response(401, {"error": "Usuario o contraseña incorrectos."})
+                return self.send_json(200, {"ok": True}, {
+                    "Set-Cookie": self.cookie_header("", 0)
+                })
 
-            account = users[real_name]
-            _, hashed = hash_password(password, account["salt"])
-            if not hmac.compare_digest(hashed, account["password_hash"]):
-                return self.json_response(401, {"error": "Usuario o contraseña incorrectos."})
+            if path == "/api/create-channel":
+                username = self.require_user()
 
-            token = secrets.token_urlsafe(32)
-            SESSIONS[token] = real_name
-            return self.json_response(
-                200, {"user": public_user(real_name, account)},
-                {"Set-Cookie": f"pouplay_session={token}; HttpOnly; SameSite=Lax; Path=/"}
-            )
+                if not username:
+                    return
 
-        if path == "/api/logout":
-            token = None
-            for part in self.headers.get("Cookie", "").split(";"):
-                if part.strip().startswith("pouplay_session="):
-                    token = part.strip().split("=", 1)[1]
-            if token:
-                SESSIONS.pop(token, None)
-            return self.json_response(
-                200, {"ok": True},
-                {"Set-Cookie": "pouplay_session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/"}
-            )
+                data = self.read_json()
+                name = str(data.get("name", "")).strip()
+                description = str(data.get("description", "")).strip()
 
-        if path == "/api/create-channel":
-            username, account = self.require_user()
-            if not username:
-                return
-            if account.get("channel"):
-                return self.json_response(409, {"error": "Tu cuenta ya tiene un canal."})
+                if not 2 <= len(name) <= 40:
+                    return self.send_json(400, {
+                        "error": "El nombre del canal debe tener entre 2 y 40 caracteres."
+                    })
 
-            name = safe_name(data.get("name"))
-            if not name:
-                return self.json_response(400, {"error": "Nombre de canal no válido."})
+                if len(description) > 1000:
+                    return self.send_json(400, {
+                        "error": "Descripción demasiado larga."
+                    })
 
-            folder = folder_for_channel(name)
-            if folder is None:
-                return self.json_response(400, {"error": "Nombre no válido."})
-            if folder.exists():
-                return self.json_response(409, {"error": "Ya existe un canal con ese nombre."})
+                existing = (
+                    db("channels")
+                    .select("id,name")
+                    .execute()
+                    .data or []
+                )
 
-            folder.mkdir()
-            write_json(folder / "info.json", {
-                "name": name,
-                "subscribers": 0,
-                "_subscribed_by": [],
-                "owner": username
+                if any(c["name"].lower() == name.lower() for c in existing):
+                    return self.send_json(409, {
+                        "error": "Ese canal ya existe."
+                    })
+
+                result = (
+                    db("channels")
+                    .insert({
+                        "name": name,
+                        "owner_username": username,
+                        "description": description
+                    })
+                    .execute()
+                    .data
+                )
+
+                return self.send_json(201, {"channel": result[0]})
+
+            if path == "/api/toggle-like":
+                username = self.require_user()
+
+                if not username:
+                    return
+
+                video_id = str(self.read_json().get("videoId", ""))
+
+                if not get_video(video_id):
+                    return self.send_json(404, {
+                        "error": "Video no encontrado."
+                    })
+
+                existing = (
+                    db("video_likes")
+                    .select("id")
+                    .eq("username", username)
+                    .eq("video_id", video_id)
+                    .execute()
+                    .data or []
+                )
+
+                if existing:
+                    (
+                        db("video_likes")
+                        .delete()
+                        .eq("id", existing[0]["id"])
+                        .execute()
+                    )
+                    liked = False
+                else:
+                    db("video_likes").insert({
+                        "username": username,
+                        "video_id": video_id
+                    }).execute()
+                    liked = True
+
+                return self.send_json(200, {"liked": liked})
+
+            if path == "/api/toggle-subscribe":
+                username = self.require_user()
+
+                if not username:
+                    return
+
+                channel_id = str(self.read_json().get("channelId", ""))
+
+                if not get_channel(channel_id):
+                    return self.send_json(404, {
+                        "error": "Canal no encontrado."
+                    })
+
+                existing = (
+                    db("subscriptions")
+                    .select("id")
+                    .eq("username", username)
+                    .eq("channel_id", channel_id)
+                    .execute()
+                    .data or []
+                )
+
+                if existing:
+                    (
+                        db("subscriptions")
+                        .delete()
+                        .eq("id", existing[0]["id"])
+                        .execute()
+                    )
+                    subscribed = False
+                else:
+                    db("subscriptions").insert({
+                        "username": username,
+                        "channel_id": channel_id
+                    }).execute()
+                    subscribed = True
+
+                return self.send_json(200, {"subscribed": subscribed})
+
+            if path == "/api/upload":
+                username = self.require_user()
+
+                if not username:
+                    return
+
+                content_type = self.headers.get("Content-Type", "")
+
+                if "multipart/form-data" not in content_type.lower():
+                    return self.send_json(400, {
+                        "error": "La solicitud debe ser multipart/form-data."
+                    })
+
+                length_header = self.headers.get("Content-Length")
+
+                if not length_header:
+                    return self.send_json(411, {
+                        "error": "Falta el tamaño de la solicitud."
+                    })
+
+                try:
+                    request_length = int(length_header)
+                except ValueError:
+                    return self.send_json(400, {
+                        "error": "Tamaño de solicitud no válido."
+                    })
+
+                # El formulario tiene algunos bytes adicionales
+                # además del archivo. Este límite solo evita cuerpos
+                # absurdamente grandes; el archivo se valida abajo.
+                if request_length <= 0 or request_length > MAX_VIDEO_SIZE + 1024 * 1024:
+                    return self.send_json(413, {
+                        "error": "Solicitud demasiado grande."
+                    })
+
+                body = self.rfile.read(request_length)
+
+                mime = (
+                    f"Content-Type: {content_type}\r\n"
+                    "MIME-Version: 1.0\r\n\r\n"
+                ).encode("utf-8") + body
+
+                message = BytesParser(policy=default).parsebytes(mime)
+
+                fields = {}
+                file_bytes = None
+                file_name = ""
+
+                for part in message.iter_parts():
+                    field_name = part.get_param(
+                        "name", header="content-disposition"
+                    )
+
+                    payload = part.get_payload(decode=True) or b""
+
+                    if field_name == "video":
+                        file_bytes = payload
+                        file_name = part.get_filename() or ""
+                    elif field_name:
+                        fields[field_name] = payload.decode(
+                            "utf-8", "replace"
+                        )
+
+                # Comprobar el tamaño REAL del archivo, en bytes.
+                # No usar el tamaño de todo el formulario multipart.
+                if file_bytes is None:
+                    return self.send_json(400, {
+                        "error": "No se recibió ningún archivo de video."
+                    })
+
+                actual_size = len(file_bytes)
+
+                # REGLA EXACTA:
+                # 52,428,800 bytes: permitido.
+                # 52,428,801 bytes: rechazado.
+                if actual_size > MAX_VIDEO_SIZE:
+                    return self.send_json(413, {
+                        "error": (
+                            "Video rechazado. El máximo permitido es "
+                            "50 MiB (52,428,800 bytes). "
+                            f"Tu archivo tiene {actual_size:,} bytes."
+                        )
+                    })
+
+                title = fields.get("title", "").strip()
+                description = fields.get("description", "").strip()
+                channel_id = fields.get("channelId", "").strip()
+
+                channel = get_channel(channel_id)
+
+                if not channel:
+                    return self.send_json(400, {
+                        "error": "Selecciona un canal válido."
+                    })
+
+                if channel["owner_username"] != username:
+                    return self.send_json(403, {
+                        "error": "Solo puedes subir videos a tu propio canal."
+                    })
+
+                if not title or len(title) > 120:
+                    return self.send_json(400, {
+                        "error": "El título es obligatorio y debe tener máximo 120 caracteres."
+                    })
+
+                if len(description) > 5000:
+                    return self.send_json(400, {
+                        "error": "La descripción es demasiado larga."
+                    })
+
+                if not file_name.lower().endswith(".mp4"):
+                    return self.send_json(400, {
+                        "error": "Solo se permiten archivos MP4."
+                    })
+
+                video_id = str(uuid.uuid4())
+                object_path = f"{channel_id}/{video_id}.mp4"
+
+                # Solo se intenta subir a Storage después de validar
+                # el tamaño real del archivo.
+                supabase.storage.from_(BUCKET).upload(
+                    object_path,
+                    file_bytes,
+                    {
+                        "content-type": "video/mp4",
+                        "cache-control": "3600",
+                        "upsert": "false"
+                    }
+                )
+
+                url = public_video_url(object_path)
+
+                inserted = (
+                    db("videos")
+                    .insert({
+                        "id": video_id,
+                        "channel_id": channel_id,
+                        "title": title,
+                        "description": description,
+                        "video_url": url
+                    })
+                    .execute()
+                    .data
+                )
+
+                return self.send_json(201, {
+                    "ok": True,
+                    "sizeBytes": actual_size,
+                    "video": video_data(inserted[0], username)
+                })
+
+            return self.send_json(404, {"error": "Ruta no encontrada."})
+
+        except Exception:
+            logging.exception("Error en POST %s", path)
+
+            return self.send_json(500, {
+                "error": (
+                    "Error interno. Revisa los registros de Render, "
+                    "las tablas de Supabase y el bucket de videos."
+                )
             })
 
-            users = load_users()
-            users[username]["channel"] = folder.name
-            write_json(USERS_FILE, users)
-            return self.json_response(201, {"user": public_user(username, users[username])})
-
-        if path == "/api/toggle-like":
-            username, _ = self.require_user()
-            if not username:
-                return
-
-            folder, info = find_video(str(data.get("channel", "")), str(data.get("video", "")))
-            if folder is None:
-                return self.json_response(404, {"error": "Video no encontrado."})
-
-            liked_by = info.get("_liked_by", [])
-            if not isinstance(liked_by, list):
-                liked_by = []
-            liked_by = list(dict.fromkeys(liked_by))
-
-            if username in liked_by:
-                liked_by.remove(username)
-                liked = False
-            else:
-                liked_by.append(username)
-                liked = True
-
-            info["likes"] = len(liked_by)
-            info["_liked_by"] = liked_by
-            write_json(folder / "info.json", info)
-            return self.json_response(200, {"likes": len(liked_by), "liked": liked})
-
-        if path == "/api/toggle-subscribe":
-            username, _ = self.require_user()
-            if not username:
-                return
-
-            channel_name = str(data.get("channel", ""))
-            channel = folder_for_channel(channel_name)
-            if channel is None or not channel.is_dir():
-                return self.json_response(404, {"error": "Canal no encontrado."})
-
-            info_path = channel / "info.json"
-            info = read_json(info_path, {})
-            if info.get("owner") == username:
-                return self.json_response(400, {"error": "No puedes suscribirte a tu propio canal."})
-
-            subscribed_by = subscriber_list(info)
-            if username in subscribed_by:
-                subscribed_by.remove(username)
-                subscribed = False
-            else:
-                subscribed_by.append(username)
-                subscribed = True
-
-            info["_subscribed_by"] = subscribed_by
-            info["subscribers"] = len(subscribed_by)
-            write_json(info_path, info)
-            return self.json_response(200, {
-                "ok": True,
-                "subscribed": subscribed,
-                "subscribers": len(subscribed_by)
-            })
-
-        return self.json_response(404, {"error": "Ruta no encontrada."})
 
 if __name__ == "__main__":
-    print("=" * 38)
-    print("PouPlay - Servidor local")
-    print("=" * 38)
+    logging.info("Iniciando PouPlay con Supabase...")
+    logging.info("Límite por video: %s bytes", MAX_VIDEO_SIZE)
+
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+
     try:
-        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
-    except OSError as e:
-        print("No se pudo iniciar el servidor:", e)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
