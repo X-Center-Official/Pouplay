@@ -12,7 +12,7 @@ from email.policy import default
 BASE = Path(__file__).resolve().parent
 CHANNELS = BASE / "Channels"
 USERS_FILE = BASE / "users.json"
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 8000
 MAX_VIDEO_SIZE = 500 * 1024 * 1024
 
@@ -1162,8 +1162,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print("=" * 38)
     print("PouPlay - Servidor local")
-    print("Abre http://127.0.0.1:8000")
-    print("Pulsa Ctrl+C para detener.")
     print("=" * 38)
     try:
         ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
