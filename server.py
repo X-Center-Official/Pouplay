@@ -22,7 +22,13 @@ from supabase import create_client
 # ============================================================
 
 HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", "10000"))
+
+port_value = os.environ.get("PORT", "10000")
+
+try:
+    PORT = int(port_value)
+except ValueError:
+    PORT = 10000
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
