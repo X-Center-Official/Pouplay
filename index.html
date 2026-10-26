@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#101114">
+<title>PouPlay</title>
+<style>
+*{box-sizing:border-box}
+:root{color-scheme:dark}
+body{margin:0;background:#101114;color:#f5f5f5;font:15px Arial,sans-serif}
+button,input{font:inherit}
+button{cursor:pointer;border:0;border-radius:10px;padding:11px 15px;background:#282a31;color:white}
+button:hover{background:#383b45}
+header{height:64px;position:sticky;top:0;z-index:5;background:#17181d;display:flex;align-items:center;gap:14px;padding:0 18px;border-bottom:1px solid #2b2c32}
+.logo{font-size:22px;font-weight:bold;color:#fff;white-space:nowrap}
+.logo span{color:#ff4545}
+.search{flex:1;max-width:600px;margin:auto}
+.search input{width:100%;border:1px solid #393a42;border-radius:24px;background:#101114;color:white;padding:12px 17px;outline:none}
+main{max-width:1250px;margin:auto;padding:22px}
+h1{font-size:25px;margin:5px 0 20px}
+h2{font-size:20px;margin:18px 0}
+.muted{color:#aaa}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:20px}
+.card{background:#191a20;border:1px solid #292a31;border-radius:14px;overflow:hidden;cursor:pointer}
+.card:hover{border-color:#555762}
+.thumb{height:140px;background:#252630;display:flex;align-items:center;justify-content:center;font-size:44px;overflow:hidden}
+.card-info{padding:13px}
+.card-title{font-size:16px;font-weight:bold;margin-bottom:8px;overflow-wrap:anywhere}
+.card-sub{font-size:13px;color:#aaa}
+.channel-head{display:flex;gap:16px;align-items:center;margin:12px 0 28px}
+.channel-avatar{width:76px;height:76px;flex-shrink:0;border-radius:50%;background:#292b35;display:flex;align-items:center;justify-content:center;font-size:32px}
+.channel-head h1{margin:0 0 8px;overflow-wrap:anywhere}
+.back{font-size:20px;padding:9px 13px}
+.player{width:100%;max-height:68vh;aspect-ratio:16/9;background:#000;border-radius:13px}
+.video-title{font-size:23px;font-weight:bold;margin:18px 0 9px;overflow-wrap:anywhere}
+.creator-link{color:#f5f5f5;font-weight:bold;cursor:pointer;background:none;padding:0}
+.creator-link:hover{text-decoration:underline}
+.video-meta{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.like{border-radius:25px;background:#292b34}
+.like.active{background:#513044;color:#ff9ac4}
+.description{white-space:pre-wrap;color:#ccc;background:#1b1c22;padding:16px;border-radius:12px;margin-top:18px}
+.empty{padding:45px 18px;text-align:center;color:#aaa;background:#191a20;border-radius:14px}
+.empty strong{display:block;color:#eee;font-size:19px;margin-bottom:10px}
+footer{text-align:center;color:#777;padding:28px}
+[hidden]{display:none!important}
+@media(max-width:600px){
+header{padding:0 10px;gap:9px;height:58px}
+.logo{font-size:19px}
+main{padding:14px}
+.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.thumb{height:105px}
+.card-info{padding:10px}
+.card-title{font-size:14px}
+.player{border-radius:8px}
+.video-title{font-size:20px}
+}
+</style>
+</head>
+<body>
+<header>
+<button id="back" class="back" aria-label="Volver" hidden>←</button>
+<div class="logo">Pou<span>Play</span></div>
+<div class="search"><input id="search" placeholder="Buscar canales o videos..." autocomplete="off"></div>
+</header>
+<main>
+<section id="home">
+<h1>Canales</h1>
+<div id="channels" class="grid"></div>
+<div id="emptyHome" class="empty" hidden>
+<strong>¡PouPlay está vacío!</strong>
+Crea manualmente una carpeta de creador dentro de Channels y añade su info.json.
+</div>
+</section>
+<section id="channelPage" hidden>
+<div class="channel-head">
+<div class="channel-avatar">▶</div>
+<div><h1 id="channelName"></h1><div id="channelSubs" class="muted"></div></div>
+</div>
+<h2>Videos</h2>
+<div id="videos" class="grid"></div>
+<div id="emptyChannel" class="empty" hidden>
+<strong>Este canal todavía no tiene videos</strong>
+Crea una carpeta por cada video dentro de la carpeta del creador.
+</div>
+</section>
+<section id="videoPage" hidden>
+<video id="player" class="player" controls playsinline preload="metadata"></video>
+<div id="videoTitle" class="video-title"></div>
+<div class="video-meta">
+<div>Creado por <button id="videoCreator" class="creator-link"></button></div>
+<button id="likeButton" class="like">♡ Me gusta · <span id="likeCount">0</span></button>
+</div>
+<div id="description" class="description" hidden></div>
+</section>
+</main>
+<footer>PouPlay · Tu colección local de videos</footer>
+<script>
+const $=id=>document.getElementById(id);
+let channels=[],currentVideos=[],currentChannel=null,currentVideo=null,searchTerm="";
+let voter=localStorage.getItem("pouplay-voter-id");
+if(!voter){voter=crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random();localStorage.setItem("pouplay-voter-id",voter)}
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function route(){return decodeURIComponent(location.pathname).split("/").filter(Boolean)}
+function go(path){history.pushState({},"",path);showRoute()}
+function setPage(n){$("home").hidden=n!=="home";$("channelPage").hidden=n!=="channel";$("videoPage").hidden=n!=="video";$("back").hidden=n==="home"}
+function back(){let p=route();if(p.length>=2)go("/"+encodeURIComponent(p[0]));else go("/")}
+$("back").onclick=back;
+window.addEventListener("popstate",showRoute);
+async function api(path,options={}){let r=await fetch(path,options),d=await r.json();if(!r.ok)throw Error(d.error||"Error del servidor");return d}
+function matches(t){return String(t||"").toLowerCase().includes(searchTerm.toLowerCase())}
+function channelCard(c){return `<article class="card" data-channel="${esc(c.name)}"><div class="thumb">👤</div><div class="card-info"><div class="card-title">${esc(c.name)}</div><div class="card-sub">${Number(c.subscribers).toLocaleString("es-MX")} suscriptores</div></div></article>`}
+function videoCard(v){return `<article class="card" data-video="${esc(v.folder)}"><div class="thumb">▶</div><div class="card-info"><div class="card-title">${esc(v.title)}</div><div class="card-sub">${esc(v.creator)} · ${Number(v.likes).toLocaleString("es-MX")} likes</div></div></article>`}
+async function loadChannels(){channels=await api("/api/channels");renderChannels()}
+function renderChannels(){let list=channels.filter(c=>matches(c.name));$("channels").innerHTML=list.map(channelCard).join("");$("emptyHome").hidden=channels.length!==0;$("channels").querySelectorAll("[data-channel]").forEach(e=>e.onclick=()=>go("/"+encodeURIComponent(e.dataset.channel)))}
+async function openChannel(name){currentChannel=name;let c=channels.find(x=>x.name===name);if(!c){go("/");return}$("channelName").textContent=c.name;$("channelSubs").textContent=Number(c.subscribers).toLocaleString("es-MX")+" suscriptores";setPage("channel");currentVideos=await api("/api/videos?channel="+encodeURIComponent(name)+"&voter="+encodeURIComponent(voter));renderVideos()}
+function renderVideos(){let list=currentVideos.filter(v=>matches(v.title)||matches(v.creator));$("videos").innerHTML=list.map(videoCard).join("");$("emptyChannel").hidden=currentVideos.length!==0;$("videos").querySelectorAll("[data-video]").forEach(e=>e.onclick=()=>go("/"+encodeURIComponent(currentChannel)+"/"+encodeURIComponent(e.dataset.video)))}
+async function openVideo(channel,folder){let d=await api("/api/video?channel="+encodeURIComponent(channel)+"&video="+encodeURIComponent(folder)+"&voter="+encodeURIComponent(voter));currentChannel=d.creator;currentVideo=d;setPage("video");$("player").pause();$("player").src=d.url;$("player").load();$("videoTitle").textContent=d.title;$("videoCreator").textContent=d.creator;$("videoCreator").onclick=()=>go("/"+encodeURIComponent(d.creator));$("likeCount").textContent=Number(d.likes).toLocaleString("es-MX");$("likeButton").classList.toggle("active",d.liked);$("likeButton").firstChild.textContent=d.liked?"♥ Me gusta · ":"♡ Me gusta · ";$("description").textContent=d.description||"";$("description").hidden=!d.description}
+async function showRoute(){let p=route();$("search").value=searchTerm;try{if(!p.length){setPage("home");await loadChannels()}else if(p.length===1){await loadChannels();await openChannel(p[0])}else await openVideo(p[0],p.slice(1).join("/"))}catch(e){setPage("home");$("channels").innerHTML="";$("emptyHome").hidden=false;$("emptyHome").innerHTML="<strong>No se pudo abrir esta página</strong>"+esc(e.message)}}
+$("search").addEventListener("input",()=>{searchTerm=$("search").value;if(!$("home").hidden)renderChannels();if(!$("channelPage").hidden)renderVideos()});
+$("likeButton").onclick=async()=>{if(!currentVideo)return;$("likeButton").disabled=true;try{let r=await api("/api/toggle-like",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:currentVideo.path,voter})});currentVideo.likes=r.likes;currentVideo.liked=r.liked;$("likeCount").textContent=Number(r.likes).toLocaleString("es-MX");$("likeButton").classList.toggle("active",r.liked);$("likeButton").firstChild.textContent=r.liked?"♥ Me gusta · ":"♡ Me gusta · "}catch(e){alert(e.message)}finally{$("likeButton").disabled=false}};
+showRoute();
+</script>
+</body>
+</html>
